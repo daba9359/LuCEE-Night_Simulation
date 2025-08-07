@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 import scipy
 from pylinex import Fitter, BasisSum, PolynomialBasis
 import perses
-import py21cmfast as p21c
 from perses.models import PowerLawTimesPolynomialModel
 from pylinex import Basis
 import perses
