@@ -46,7 +46,7 @@ As = 2.099e-9  # Amplitude of a power spectrum of adiabatic perturbations
 ns = 0.9649    # Spectra index of a power spectrum of adiabatic perturbations
 
 ### Common equations:
-H = lambda z: (H0*3.24078e-20)*(1+z)*np.sqrt(omR0*(1+z)**2+omM0*(1+z)+omK0+(omL0/((1+z)**2)))  # Standard Lambda CDM hubble flow in inverse seconds
+H = lambda z,omR0,omM0,omK0,omL0: (H0*3.24078e-20)*(1+z)*np.sqrt(omR0*(1+z)**2+omM0*(1+z)+omK0+(omL0/((1+z)**2)))  # Standard Lambda CDM hubble flow in inverse seconds
 ## Some important functions 
 
 # x_e
@@ -96,9 +96,11 @@ T_S = lambda z,x_e,T_k: (1+x_c(z,x_e,T_k))/((1/(T_gamma0*(1+z)))+(x_c(z,x_e,T_k)
 # z is your redshift (can be an array or single value)
 # x_e is your fraction of free electrons functions (with z as an argument)
 # T_k is your gas temperature functions (with z as an argument)
-dTb = lambda z,x_e,T_k: 27*(1-x_e(z))*((h**2*omB0)/(0.023))*(((0.15)/(h**2*omM0))*((1+z)/(10)))**(1/2)*(1-((T_gamma0*(1+z))/(T_S(z,x_e,T_k))))
+dTb = lambda z,x_e,T_k,omB0,omM0: 27*(1-x_e(z))*((h**2*omB0)/(0.023))*(((0.15)/(h**2*omM0))*((1+z)/(10)))**(1/2)*(1-((T_gamma0*(1+z))/(T_S(z,x_e,T_k))))
 
-def Tk (z_array):
+# Kinetic gas temperature with a  Runge-Kutta method of order 5(4)
+
+def Tk (z_array,omR0,omM0,omK0,omL0):
     """Creates an array evolving the IGM temperature based on adiabatic cooling and compton scattering. Only works for the cosmic 
     Dark Ages, as it does not include UV
     
@@ -107,18 +109,23 @@ def Tk (z_array):
     ===================================================================
     z_array: an array of increasing redshift values. Needs to be a sufficiently fine grid. 
     As of now there is some considerable numerical instabilities when your z grid is > 0.01
+    omR0: Density prameter of radiation today
+    omM0: Density parameter of matter today
+    omK0: Density pramameter of curvature today
+    omL0: Density parameter of Dark Energy today
     ===================================================================
     Output
     ===================================================================
     Tk_array:  A 2-D array with each entry being the redshift and IGM temperature
     Tk_function: Interpolated version of your Tk_array that acts like a function with
-    redshift for its argument. Useful for future calculations."""
+                 redshift for its argument. Useful for future calculations.
+    cosmological_parameters: An output of the cosmo parameters used to make the curve (just returns your density parameter inputs)"""
 ### Let's code up T_k 
     # some important functions
     t_c = lambda z: 1.172e8*((1+z)/10)**(-4) * 3.154e7 #[seconds] timescale of compton scattering
     x_e = camb_xe_interp   # this is our model for fraction of free electrons
-    adiabatic = lambda z,T:(1/(H(z)*(1+z)))*(2*H(z)*T)
-    compton = lambda z,T: (1/(H(z)*(1+z)))*((x_e(z))/(1+f_He+x_e(z)))*((T_gamma(z)-T)/(t_c(z)))
+    adiabatic = lambda z,T:(1/(H(z,omR0,omM0,omK0,omL0)*(1+z)))*(2*H(z,omR0,omM0,omK0,omL0)*T)
+    compton = lambda z,T: (1/(H(z,omR0,omM0,omK0,omL0)*(1+z)))*((x_e(z))/(1+f_He+x_e(z)))*((T_gamma(z)-T)/(t_c(z)))
     z_start = z_array[-1]
     z_end = z_array[0]
 
@@ -140,5 +147,43 @@ def Tk (z_array):
     Tk_function=scipy.interpolate.CubicSpline(z[::-1],T[::-1])  # Turns our output into a function with redshift as an argument  
     T_array = np.array([z,T])  
 
-    Tk_function=scipy.interpolate.CubicSpline(z[::-1],T[::-1])  # Turns our output into a function with redshift as an argument    
-    return T_array, Tk_function
+    Tk_function=scipy.interpolate.CubicSpline(z[::-1],T[::-1])  # Turns our output into a function with redshift as an argument 
+    cosmological_parameters = np.array([omR0,omM0,omK0,omL0])   
+    return T_array, Tk_function, cosmological_parameters
+
+def lambdaCDM_training_set(frequency_array,parameters,N):
+    """"Creates a training set based on the error range of the Lambda CDM cosmological constants for the fiducial 21 cm signal
+    (no exotic physics).
+    Parameters
+    ===================================================
+    frequency_array: array of frequencies to calculate the curve at. array-like.
+    parameters: Set of mean values and standard deviation of your parameters. Make sure the order matches the order of the function
+                As of writing this that order is: omR0,omM0,omK0,omL0,omB0. Shape should be, in this example, (5,2), with the first 
+                column being the mean and the second being the standard deviation.
+    N: The number of curves you would like to have in your training set. Interger
+    bin_number: The number of bins in frequency space used to make the curves. Recommend 250 for LuSEE-Night as of the time writing this.
+    
+    Returns
+    ====================================================
+    training_set: An array with your desired number of varied fiducial 21 cm curves"""
+
+    training_set = np.ones((N,len(frequency_array)))    # dummy array for the expanded training set
+    training_set_params = np.ones((N,len(parameters)))  # dummy array for the parameters of this expanded set.
+    # Note: The divide by 2 is there 
+
+    for n in range(N):   # this will create our list of new parameters that will be randomly chosen from within the original training set's parameter space.
+        new_params = np.array([])
+        for k in range(len(parameters)):  # this will create a new set of random parameters for each instance
+            new_params = np.append(new_params,np.random.normal(loc=parameters[k][0],scale=parameters[k][1]))
+        training_set_params[n] = new_params
+
+    redshift_array = 1420.4/frequency_array-1 
+    redshift_array = redshift_array[::-1]      # need to convert to redshift since all of our functions are in redshift
+    for n in range(N):
+        R,M,K,L,B=training_set_params[n]
+        T_k = Tk(redshift_array,R,M,K,L)[1]   # calculate our kinetic temperature to plug into the dTb function
+        dTb_element=dTb(redshift_array,camb_xe_interp,T_k,B,M)*10**(-3)   # Need to convert back to Kelvin
+        dTb_element=dTb_element[::-1]   # You have to flip it again because of the way dTb calculates based on redshift (needs previous higher redshift to calculate next redshift)
+        training_set[n] = dTb_element
+    
+    return training_set, training_set_params
