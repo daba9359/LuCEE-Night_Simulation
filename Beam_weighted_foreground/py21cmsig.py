@@ -442,10 +442,123 @@ def DMD_training_set(frequency_array,parameters,N,gaussian=False,B = omB0, M=omM
                 new_params = np.append(new_params,parameter_interpolators[k](np.random.random()*5))
             training_set_params[n] = new_params
 
-    for n in range(N):
+    for n in tqdm(range(N)):
         fDMD=training_set_params[n]
         DMD_Tk = Tk_DMD(redshift_array,fDMD,C)  # calculate our kinetic temperature to plug into the dTb function
         dTb_element=dTb(redshift_array,DMD_Tk[2],DMD_Tk[1],B,M)  # Need to convert back to Kelvin
+        training_set_rs[n] = dTb_element
+    # Now we need to interpolate back to frequency
+    redshift_array_mod = 1420.4/frequency_array-1   
+    for n in range(N):
+        interpolator = scipy.interpolate.CubicSpline(redshift_array,training_set_rs[n])
+        training_set[n] = interpolator(redshift_array_mod)
+    
+    return training_set, training_set_params
+
+# Millicoulumb simplified
+# This is our custom T_k code with additional cooling
+
+def Tk_cool_simp (z_array,C):
+    """Creates an array evolving the IGM temperature based on adiabatic cooling and compton scattering. Only works for the cosmic 
+    Dark Ages, as it does not include UV
+    
+    ===================================================================
+    Parameters
+    ===================================================================
+    z_array: an array of increasing redshift values
+    C: Phenomenological parameter that represents the effect of additional cooling from this model
+    ===================================================================
+    Output
+    ===================================================================
+    Tk_array:  A 2-D array with each entry being the redshift and IGM temperature"""
+### Let's code up T_k
+    num=len(z_array)
+    t_c = lambda z: 1.2e8*((1+z)/10)**(-4) * 3.154e7 #[seconds] timescale of compton scattering
+
+    x_e = camb_xe_interp   # this is our model for fraction of free electrons
+    Tk_array = np.zeros((num-1,2))
+
+
+
+    ## T_X stuff (Temperature of dark matter)
+
+    TX_array = np.zeros((num-1,2))
+    rate_dm = lambda z: 1/(C)*(1/(1+z)**(1))*10e16
+    
+    ### Heating and Cooling Processes ###
+    adiabatic = lambda z,T:(1/(H(z,omR0,omM0,omK0,omL0)*(1+z)))*(2*H(z,omR0,omM0,omK0,omL0)*T)
+    compton = lambda z,T: (1/(H(z,omR0,omM0,omK0,omL0)*(1+z)))*((x_e(z))/(1+f_He+x_e(z)))*((T_gamma(z)-T)/(t_c(z)))
+    Millicharged = lambda z,T,T_X: (1/(H(z,omR0,omM0,omK0,omL0)*(1+z)))*((T-T_X)/(rate_dm(z)))
+
+    # Define the differential equation system
+    def equations(z, y):
+        T, TX = y
+        dT_dz = adiabatic(z,T)-compton(z,T) + Millicharged(z,T,TX)
+        dTX_dz = adiabatic(z,TX)-(omB0/(10*omC0))*Millicharged(z,T,TX)
+        return [dT_dz, dTX_dz]
+
+    # Initial conditions
+    z0 = [3000, 3000]
+
+    # Time span
+    z_span = (1100, 20)
+
+    # Solve the differential equation
+    sol = solve_ivp(equations, z_span, z0, dense_output=True, method='Radau')
+
+    # Access the solution
+    t = sol.t
+    T, TX = sol.y
+
+    Tk_array = np.array([t,T])
+    TX_array = np.array([t,TX])
+    Tk_function=scipy.interpolate.CubicSpline(t[::-1],T[::-1])  # Turns our output into a function with redshift as an argument    
+    return Tk_array, Tk_function, TX_array
+
+def MCDM_training_set(frequency_array,parameters,N,gaussian=False,B = omB0, M=omM0):
+    """"Creates a training set of singal curves based on the parameter range of the dark matter decay model.
+    
+    Parameters
+    ===================================================
+    frequency_array: array of frequencies to calculate the curve at. array-like.
+    parameters: Set of mean values and standard deviation of your parameters if gaussian. If Gaussian, first column is mean, second column is standard deviation
+                If not Gaussian, then each column is a different value within that parameter space that will be interpolated.
+                 This allows the parameter space to be sampled in a nonlinear way in order to avoid too many curves in one area. Each row is a different parameter.
+    N: The number of curves you would like to have in your training set. Interger
+    B: Density parameter for baryons. Only here because dTb needs it for optical depth. 
+    M: Density parameter for matter. Only here because dTb needs it for optical depth.
+    
+    Returns
+    ====================================================
+    training_set: An array with your desired number of varied 21 cm curves"""
+    redshift_array=np.arange(20,1100,0.01)
+    training_set_rs = np.ones((N,len(redshift_array)))    # dummy array for the expanded training set in redshift
+    training_set = np.ones((N,len(frequency_array)))      # dummy array for the expanded training set in frequency
+    training_set_params = np.ones((N,len(parameters)))  # dummy array for the parameters of this expanded set.
+
+     # This creates an interpolator that can sample the parameters in a more equal way than a linear randomization.
+    parameter_interpolators = {}
+    for p in range(len(parameters)):
+        x = range(len(parameters[p]))
+        y = parameters[p]
+        parameter_interpolator = scipy.interpolate.CubicSpline(x,y)
+        parameter_interpolators[p] = parameter_interpolator
+    
+    for n in range(N):   # this will create our list of new parameters that will be randomly chosen from within the original training set's parameter space.
+        new_params = np.array([])
+        if gaussian:
+            for k in range(len(parameters)):  # this will create a new set of random parameters for each instance
+                new_params = np.append(new_params,np.random.normal(loc=parameters[k][0],scale=parameters[k][1]))
+            training_set_params[n] = new_params
+        else:
+            for k in range(len(parameters)):  # this will create a new set of random parameters for each instance
+                new_params = np.append(new_params,parameter_interpolators[k](np.random.random()*5))
+            training_set_params[n] = new_params
+
+    for n in tqdm(range(N)):
+        MCDM_C=training_set_params[n][0]
+        MCDM_Tk = Tk_cool_simp(redshift_array,MCDM_C)  # calculate our kinetic temperature to plug into the dTb function
+        dTb_element=dTb(redshift_array,camb_xe_interp,MCDM_Tk[1],B,M)  # Need to convert back to Kelvin
         training_set_rs[n] = dTb_element
     # Now we need to interpolate back to frequency
     redshift_array_mod = 1420.4/frequency_array-1   
