@@ -309,7 +309,7 @@ def DMAN_training_set(frequency_array,parameters,N,gaussian=False,B = omB0, M=om
                 new_params = np.append(new_params,parameter_interpolators[k](np.random.random()*5))
             training_set_params[n] = new_params
 
-    for n in range(N):
+    for n in tqdm(range(N)):
         fDMAN=training_set_params[n]
         DMAN_Tk = Tk_DMAN(redshift_array,fDMAN)  # calculate our kinetic temperature to plug into the dTb function
         dTb_element=dTb(redshift_array,DMAN_Tk[2],DMAN_Tk[1],B,M)  # Need to convert back to Kelvin
@@ -665,3 +665,102 @@ def EDE_training_set(frequency_array,parameters,N,gaussian=False,B = omB0, M=omM
         training_set[n] = interpolator(redshift_array_mod)
     
     return training_set, training_set_params
+
+# This will be our ERB model
+
+
+def ERB_model (z_array,A_r_value,frequency,starting_point,smoothing,T_k,x_e=camb_xe_interp,smoothing_factor = 0):
+    """Creates the Excess Radio Background model to see how it effects the 21cm dark ages trough
+    
+    Parameters
+    ===================================================
+    z_array: an array of increasing redshift values. Needs to be a sufficiently fine grid. 
+    As of now there is some considerable numerical instabilities when your z grid is > 0.01
+
+    A_r_value: Non-dimensional amplitude of the ERB
+
+    frequency: Has to do with the shape. It makes sure you get a good trough at that frequency. In MHz
+
+    starting_point = the redshift it whicht to turn the ERB on (it isn't necessarily ubiquitous at all z)
+
+    smoothing = this determines the value of the error function which determines how dramatic the smoothing for the curve
+                is.  This is done to emulate the fact that the source of the ERB isn't necessarily going to immediately turn on,
+                but will instead slowly turn on depending on how you adjust this number.
+
+    Tk:  The function that creates your gas temperature.  Takes z as an argument, though other parameters are necessary for non standard Tk's.
+
+    x_e:  The equation that defines your evolution of free electron fraction. Requires z as an argument
+    ===================================================
+    returns an array and spline function to plot"""
+
+    # The upper limit of the 21 cm temperature:
+    lambda_21 = 21  # wavelength of 21cm line [cm]
+    max_temp = lambda z,x_e,T_k: -1000*(n_H(z,x_e)*k_HH(T_k(z))+n_e(z,x_e)*k_eH(T_k(z)))*(3*h_pl*c*lambda_21**2*n_H(z,x_e)*T_star)/(32*np.pi*kb*(1+z)*H(z,omR0,omM0,omK0,omL0)*T_k(z))  #[mK]
+    max_temp_interp=scipy.interpolate.CubicSpline(z_array,max_temp(z_array,camb_xe_interp,My_Tk[1]))
+
+    alpha = -2.6   # dimensionless quantity that defines the spectral index of the signal
+    nu_obs = lambda z: 1420/(1+z)  # [MHz] observed frequency of the 21 cm line
+    #T_k = Tk_ERB(z_array,A_r,frequency)[1]   # converts the T_k raw function into the spline function
+    x_c = lambda z,x_e,T_k: (T_star)/(T_gamma0*(1+z)*A_10)*(n_H(z,x_e)*k_HH(T_k(z))+n_e(z,x_e)*k_eH(T_k(z)))
+    A_r = lambda z: -A_r_value/2*scipy.special.erf(smoothing*(z-starting_point+smoothing_factor))+A_r_value/2
+    T_R = lambda z: T_gamma(z)*(1+A_r(z)*(nu_obs(z)/frequency)**alpha)
+ 
+    dTb = lambda z,x_e,T_k: 27*(1-x_e(z))*((h**2*omB0)/(0.023))*(((0.15)/(h**2*omM0))*((1+z)/(10)))**(1/2)*((x_c(z,x_e,T_k)*T_gamma(z)/T_R(z))/\
+                                                                                                            (1+((x_c(z,x_e,T_k)*T_gamma(z)/T_R(z)))))*(1-(T_R(z)/T_k(z)))*1e-3  # convert to Kelvin
+    
+    ERB_function = scipy.interpolate.CubicSpline(z_array,dTb(z_array,x_e,T_k))
+    return ERB_function
+
+def ERB_training_set(frequency_array,parameters,N,T_k,x_e=camb_xe_interp,gaussian=False,B = omB0, M=omM0):
+    """"Creates a training set of singal curves based on the parameter range of the dark matter decay model.
+    
+    Parameters
+    ===================================================
+    frequency_array: array of frequencies to calculate the curve at. array-like.
+    parameters: Set of mean values and standard deviation of your parameters if gaussian. If Gaussian, first column is mean, second column is standard deviation
+                If not Gaussian, then the first column is the minimum value and the second is the maximum. Each row is a different parameter.
+    N: The number of curves you would like to have in your training set. Interger
+    Tk:  The function that creates your gas temperature.  Takes z as an argument, though other parameters are necessary for non standard Tk's.
+    x_e:  The equation that defines your evolution of free electron fraction. Requires z as an argument
+    B: Density parameter for baryons. Only here because dTb needs it for optical depth. 
+    M: Density parameter for matter. Only here because dTb needs it for optical depth.
+    
+    Returns
+    ====================================================
+    training_set: An array with your desired number of varied 21 cm curves"""
+    redshift_array=np.arange(20,1100,0.01)
+    training_set_rs = np.ones((N,len(redshift_array)))    # dummy array for the expanded training set in redshift
+    training_set = np.ones((N,len(frequency_array)))      # dummy array for the expanded training set in frequency
+    training_set_params = np.ones((N,len(parameters)))  # dummy array for the parameters of this expanded set.
+
+     # This creates an interpolator that can sample the parameters in a more equal way than a linear randomization.
+    parameter_interpolators = {}
+    for p in range(len(parameters)):
+        x = range(len(parameters[p]))
+        y = parameters[p]
+        parameter_interpolator = scipy.interpolate.CubicSpline(x,y)
+        parameter_interpolators[p] = parameter_interpolator
+    
+    for n in range(N):   # this will create our list of new parameters that will be randomly chosen from within the original training set's parameter space.
+        new_params = np.array([])
+        if gaussian:
+            for k in range(len(parameters)):  # this will create a new set of random parameters for each instance
+                new_params = np.append(new_params,np.random.normal(loc=parameters[k][0],scale=parameters[k][1]))
+            training_set_params[n] = new_params
+        else:
+            for k in range(len(parameters)):  # this will create a new set of random parameters for each instance
+                new_params = np.append(new_params,parameter_interpolators[k](np.random.random()*5))
+            training_set_params[n] = new_params
+
+    for n in range(N):
+        z_s,Ar=training_set_params[n]
+        ERB_function = ERB_model(redshift_array,Ar,78,z_s,0.2,T_k)  # calculates the ERB model
+        ERB_element=ERB_function(redshift_array)  # Need to convert back to Kelvin
+        training_set_rs[n] = ERB_element
+    # Now we need to interpolate back to frequency
+    redshift_array_mod = 1420.4/frequency_array-1   
+    for n in range(N):
+        interpolator = scipy.interpolate.CubicSpline(redshift_array,training_set_rs[n])
+        training_set[n] = interpolator(redshift_array_mod)
+    
+    return training_set, training_set_params, training_set_rs
