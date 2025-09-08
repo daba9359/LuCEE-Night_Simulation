@@ -152,6 +152,8 @@ def Tk (z_array,omR0,omM0,omK0,omL0):
     cosmological_parameters = np.array([omR0,omM0,omK0,omL0])   
     return T_array, Tk_function, cosmological_parameters
 
+My_Tk = Tk(z_array,omR0,omM0,omK0,omL0)
+
 def lambdaCDM_training_set(frequency_array,parameters,N):
     """"Creates a training set based on the error range of the Lambda CDM cosmological constants for the fiducial 21 cm signal
     (no exotic physics).
@@ -312,7 +314,7 @@ def DMAN_training_set(frequency_array,parameters,N,gaussian=False,B = omB0, M=om
     for n in tqdm(range(N)):
         fDMAN=training_set_params[n]
         DMAN_Tk = Tk_DMAN(redshift_array,fDMAN)  # calculate our kinetic temperature to plug into the dTb function
-        dTb_element=dTb(redshift_array,DMAN_Tk[2],DMAN_Tk[1],B,M)  # Need to convert back to Kelvin
+        dTb_element=dTb(redshift_array,DMAN_Tk[2],DMAN_Tk[1],B,M)*1e-3  # Need to convert back to Kelvin
         training_set_rs[n] = dTb_element
     # Now we need to interpolate back to frequency
     redshift_array_mod = 1420.4/frequency_array-1   
@@ -445,7 +447,7 @@ def DMD_training_set(frequency_array,parameters,N,gaussian=False,B = omB0, M=omM
     for n in tqdm(range(N)):
         fDMD=training_set_params[n]
         DMD_Tk = Tk_DMD(redshift_array,fDMD,C)  # calculate our kinetic temperature to plug into the dTb function
-        dTb_element=dTb(redshift_array,DMD_Tk[2],DMD_Tk[1],B,M)  # Need to convert back to Kelvin
+        dTb_element=dTb(redshift_array,DMD_Tk[2],DMD_Tk[1],B,M)*1e-3 # Need to convert back to Kelvin
         training_set_rs[n] = dTb_element
     # Now we need to interpolate back to frequency
     redshift_array_mod = 1420.4/frequency_array-1   
@@ -558,7 +560,7 @@ def MCDM_training_set(frequency_array,parameters,N,gaussian=False,B = omB0, M=om
     for n in tqdm(range(N)):
         MCDM_C=training_set_params[n][0]
         MCDM_Tk = Tk_cool_simp(redshift_array,MCDM_C)  # calculate our kinetic temperature to plug into the dTb function
-        dTb_element=dTb(redshift_array,camb_xe_interp,MCDM_Tk[1],B,M)  # Need to convert back to Kelvin
+        dTb_element=dTb(redshift_array,camb_xe_interp,MCDM_Tk[1],B,M)*1e-3  # Need to convert back to Kelvin
         training_set_rs[n] = dTb_element
     # Now we need to interpolate back to frequency
     redshift_array_mod = 1420.4/frequency_array-1   
@@ -589,27 +591,39 @@ def Tk_EDE (z_array,Omega_ee,z_c):
     redshift for its argument. Useful for future calculations."""
 ### Let's code up T_k
     num=len(z_array)
+    oee = Omega_ee
     t_c = lambda z: 1.172e8*((1+z)/10)**(-4) * 3.154e7 #[seconds] timescale of compton scattering
     a_c = lambda z: 1/(1+z)
-    H = lambda z,oee,a_c: (H0*3.24078e-20)*np.sqrt(omR0*(1+z)**4+omM0*(1+z)**3+omK0*(1+z)**2+oee*((1+a_c(z_c)**6)/((1/(1+z))**6+a_c(z_c)**6)))
-    # Hubble flow function with a conversion factor
-    # zlog = np.logspace(np.log10(z_array[0]),np.log10(z_array[-1]),num=num)[::-1]
-    # zlog = np.append(zlog,0)
-    zlog = z_array[::-1]
-    T = T_gamma(z_array[-1])   # your initial temperature at the highest redshift. This assumes it is coupled fully to the CMB at that time.
-    ze = z_array[-1]           # defines your starting z (useful for the loop below)
-    x_e = camb_xe_interp   # this is our model for fraction of free electrons
-    Tk_array = np.zeros((num-1,2))
-    adiabatic = lambda zs,T,ze:(1/(H(zs,Omega_ee,a_c)*(1+zs)))*(2*H(zs,Omega_ee,a_c)*T)*(ze-zs)
-    compton = lambda zs,T,ze: (1/(H(zs,Omega_ee,a_c)*(1+zs)))*((x_e(zs))/(1+f_He+x_e(zs)))*((T_gamma(zs)-T)/(t_c(zs)))*(ze-zs)
-    for i in range(num-1):
-        zs = ze
-        ze = zlog[i+1]
-        T += adiabatic(zs,T,ze)-compton(zs,T,ze)    # This is where you would add the phenomenological cooling and heating parts
-        Tk_array[i][0] = ze
-        Tk_array[i][1] = T
-    Tk_function=scipy.interpolate.CubicSpline(Tk_array.transpose()[0][::-1],Tk_array.transpose()[1][::-1])  # Turns our output into a function with redshift as an argument    
-    return Tk_array, Tk_function
+    x_e = camb_xe_interp
+    H_EDE = lambda z: (H0*3.24078e-20)*np.sqrt(omR0*(1+z)**4+omM0*(1+z)**3+omK0*(1+z)**2+oee*((1+a_c(z_c)**6)/((1/(1+z))**6+a_c(z_c)**6)))
+    z_start = z_array[-1]
+    z_end = z_array[0]
+    adiabatic = lambda z,T:(1/(H_EDE(z)*(1+z)))*(2*H_EDE(z)*T)
+    compton = lambda z,T: (1/(H_EDE(z)*(1+z)))*((x_e(z))/(1+f_He+x_e(z)))*((T_gamma(z)-T)/(t_c(z)))
+
+    ### Let's code up T_k
+    ## The heating / cooling processes ##
+
+    T0 = np.array([T_gamma(z_array[-1])])   # your initial temperature at the highest redshift. This assumes it is coupled fully to the CMB at that time.
+    z0 = z_array[-1]    # defines your starting z (useful for the loop below)
+    z_span = (z_start,z_end)
+    func = lambda z,T: adiabatic(z,T) - compton(z,T)
+
+    # Solve the differential equation
+    sol = solve_ivp(func, z_span, T0, dense_output=True, method='Radau')  # solve_ivp is WAY WAY WAY faster and plenty precise enough for what we're doing
+
+    # Access the solution
+    z = sol.t
+    T = sol.y[0]
+
+    Tk_function=scipy.interpolate.CubicSpline(z[::-1],T[::-1])  # Turns our output into a function with redshift as an argument  
+    T_array = np.array([z,T])  
+
+    Tk_function=scipy.interpolate.CubicSpline(z[::-1],T[::-1])  # Turns our output into a function with redshift as an argument 
+    cosmological_parameters = np.array([omR0,omM0,omK0,omL0])
+
+
+    return T_array, Tk_function
 
 def EDE_training_set(frequency_array,parameters,N,gaussian=False,B = omB0, M=omM0):
     """"Creates a training set of singal curves based on the parameter range of the dark matter self-annihilation model.
@@ -656,7 +670,7 @@ def EDE_training_set(frequency_array,parameters,N,gaussian=False,B = omB0, M=omM
     for n in tqdm(range(N)):
         oee,z_c=training_set_params[n]
         EDE_Tk = Tk_EDE(redshift_array,oee,z_c)  # calculate our kinetic temperature to plug into the dTb function
-        dTb_element=dTb(redshift_array,camb_xe_interp,EDE_Tk[1],B,M)  # Need to convert back to Kelvin
+        dTb_element=dTb(redshift_array,camb_xe_interp,EDE_Tk[1],B,M)*1e-3  # Need to convert back to Kelvin
         training_set_rs[n] = dTb_element
     # Now we need to interpolate back to frequency
     redshift_array_mod = 1420.4/frequency_array-1   
@@ -669,7 +683,7 @@ def EDE_training_set(frequency_array,parameters,N,gaussian=False,B = omB0, M=omM
 # This will be our ERB model
 
 
-def ERB_model (z_array,A_r_value,frequency,starting_point,smoothing,T_k,x_e=camb_xe_interp,smoothing_factor = 0):
+def ERB_model (z_array,A_r_value,frequency,starting_point,smoothing,T_k=My_Tk[1],x_e=camb_xe_interp,smoothing_factor = 0):
     """Creates the Excess Radio Background model to see how it effects the 21cm dark ages trough
     
     Parameters
@@ -711,7 +725,7 @@ def ERB_model (z_array,A_r_value,frequency,starting_point,smoothing,T_k,x_e=camb
     ERB_function = scipy.interpolate.CubicSpline(z_array,dTb(z_array,x_e,T_k))
     return ERB_function
 
-def ERB_training_set(frequency_array,parameters,N,T_k,x_e=camb_xe_interp,gaussian=False,B = omB0, M=omM0):
+def ERB_training_set(frequency_array,parameters,N,T_k=My_Tk[1],x_e=camb_xe_interp,gaussian=False,B = omB0, M=omM0):
     """"Creates a training set of singal curves based on the parameter range of the dark matter decay model.
     
     Parameters
@@ -752,7 +766,7 @@ def ERB_training_set(frequency_array,parameters,N,T_k,x_e=camb_xe_interp,gaussia
                 new_params = np.append(new_params,parameter_interpolators[k](np.random.random()*5))
             training_set_params[n] = new_params
 
-    for n in range(N):
+    for n in tqdm(range(N)):
         z_s,Ar=training_set_params[n]
         ERB_function = ERB_model(redshift_array,Ar,78,z_s,0.2,T_k)  # calculates the ERB model
         ERB_element=ERB_function(redshift_array)  # Need to convert back to Kelvin
