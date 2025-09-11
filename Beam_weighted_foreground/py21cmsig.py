@@ -1,4 +1,37 @@
 
+# boiler plate for most pylinex 21-cm stuff
+
+
+
+
+
+
+
+
+
+
+import healpy as hp
+from PIL import Image
+import matplotlib.animation as animation
+from astropy.io import fits
+import os
+import copy
+from pylinex import Fitter, BasisSum, PolynomialBasis, MetaFitter, AttributeQuantity
+from pylinex import Basis
+from pylinex import TrainedBasis
+import pylinex
+import py21cmsig
+import importlib
+import corner
+import lochness
+from tqdm import tqdm
+from matplotlib.animation import FuncAnimation
+from importlib import reload
+from pylinex import RepeatExpander, ShapedExpander, NullExpander,\
+    PadExpander, CompiledQuantity, Extractor
+import spiceypy as spice
+from datetime import datetime
+import enlighten
 import h5py
 import numpy as np
 import matplotlib.pyplot as plt
@@ -12,6 +45,7 @@ import ares
 import camb
 from scipy.integrate import solve_ivp
 from tqdm import tqdm
+
 # Some basic constants
 kb = 1.3807e-16    # Boltzman's constant [ergs per Kelvin]
 kb_ev = 8.617e-5   # Boltzman's constant [electron volts per Kelvin]
@@ -98,6 +132,112 @@ T_S = lambda z,x_e,T_k: (1+x_c(z,x_e,T_k))/((1/(T_gamma0*(1+z)))+(x_c(z,x_e,T_k)
 # x_e is your fraction of free electrons functions (with z as an argument)
 # T_k is your gas temperature functions (with z as an argument)
 dTb = lambda z,x_e,T_k,omB0,omM0: 27*(1-x_e(z))*((h**2*omB0)/(0.023))*(((0.15)/(h**2*omM0))*((1+z)/(10)))**(1/2)*(1-((T_gamma0*(1+z))/(T_S(z,x_e,T_k))))
+
+########### Foreground and Beam Related Constants ###################
+
+NSIDE = 32 # resolution of the map
+NPIX = hp.nside2npix(NSIDE)
+NPIX   # total number of pixels (size of the array being used)
+location = (-23.815,182.25)  # The lat lon location of the moon landing site
+spice_kernels = "/home/dbarker7752/lochness/input/spice_kernels/" #location of the spice kernels
+frequencies = np.arange(6,50,0.1)
+
+# Cosmological Parameters
+H0 = 67.36     # Hubble constant 
+h = H0/100     # H0
+omM0 = 0.3152   # Omega matter today
+omB0 = 0.0493   # Omega baryons today 
+omK0 = 0        # Omega curvature today
+omC0 = 0.2645   # Omega cold dark matter today 
+#omR0 = 8.98e-5  # Omega radiation today
+omR0=8.600000001024455e-05  # Omega radiation from 21cm FAST
+omL0 = 0.6847   # Omega Dark Energy today
+
+### Boilerplate arrays for healpy (changes with a change in resolution)
+thetas = hp.pix2ang(NSIDE,np.arange(NPIX))[0]*(180/np.pi)
+phis = hp.pix2ang(NSIDE,np.arange(NPIX))[1]*(180/np.pi)
+coordinate_array = np.ones((NPIX,2))
+for i in np.arange(NPIX):
+    coordinate_array[i] = np.array([phis[i],thetas[i]])
+
+# HASLAM map
+gal = perses.foregrounds.HaslamGalaxy()
+haslam_data=gal.get_map(39.93) # gets the actual array of the data for that haslam map
+
+# ULSA map
+ULSA_direction_raw = fits.open("/home/dbarker7752/21_cm_group/ULSA Maps/000.fits")
+ULSA_frequency = fits.open("/home/dbarker7752/21_cm_group/ULSA Maps/210.fits")
+ULSA_constant = fits.open("/home/dbarker7752/21_cm_group/ULSA Maps/220.fits")
+
+# This cell fixes the hole in the ULSA data via an interpolation
+
+# This identifies the pixels of the dead zone
+vec = hp.ang2vec(np.pi/2*1.1, -np.pi/2*1.05)
+indices=hp.query_disc(nside=NSIDE,vec=vec,radius=0.19)
+hole_map = copy.deepcopy(ULSA_direction_raw[0].data[7])
+hole_map[indices] = 10000000
+hp.mollview(ULSA_direction_raw[0].data[7])
+# These indices will be our region 10 which is the region we ignore
+indices_deadzone = indices
+
+
+x = np.arange(NPIX)
+x = np.delete(x,indices_deadzone) # Gets rid of the dead zone
+ULSA_min_deadzone = copy.deepcopy(ULSA_direction_raw[0].data)
+for i,data in enumerate(ULSA_direction_raw[0].data):
+    y = data
+    y = np.delete(y,indices_deadzone)
+    interpolator = scipy.interpolate.CubicSpline(x,y)
+    for j in indices_deadzone:
+        ULSA_min_deadzone[i][j] = interpolator(j)
+hp.mollview(ULSA_min_deadzone[7])
+
+ULSA_direction = ULSA_min_deadzone
+
+# creates a list of all the beam file names.
+path = "/home/dbarker7752/21_cm_group/Varied_Regolith/Beams"
+files = []
+for file in os.listdir(path):
+    files.append(path+"/"+file)
+
+# some other useful global variables
+galaxy_map = ULSA_direction    # default galaxy map
+test_times1 = [[2026,12,22,1,0,0]]   # list of times LOCHNESS will rotate the sky for 
+frequency_array = np.array(range(1,51))   # list of frequencies we're evaluating at   
+
+# modifies the galaxy map to not have the CMB (to make it consistent with the delta CMB convention of the signal)
+galaxy_map_minCMB = copy.deepcopy(galaxy_map)
+redshift_array = 1420.4/frequency_array-1
+# This loop creates a CMB subtracted galaxy map to input into LOCHNESS. I've commented it out so you don't have to take 5 min to import this module
+# for i,j in enumerate(redshift_array):
+#     galaxy_map_minCMB[i] = galaxy_map[i] - py21cmsig.T_gamma(j)
+# galaxy_map_minCMB[np.where(galaxy_map_minCMB<0.0)] = 0   # Gets rid of the negatives that plague this ULSA map (not sure why they are they)
+# foreground_array_minCMB = lochness.LOCHNESS(spice_kernels,test_times1,location,galaxy_map=galaxy_map_minCMB).lunar_frame_galaxy_maps
+# foreground_array_minCMB[np.where(foreground_array_minCMB<0.0)] = 0
+
+# radiometer noise
+sigT = lambda T_b, dnu, dt: T_b/(np.sqrt(dnu*dt))
+# Noise parameters
+dnu = 1e6
+dt = 10000*3600 # first number is the number of hours of integration time
+
+# Synchrotron Equation
+synch = lambda f,A,B,c : A*(f/408)**(B+c*np.log(f/408))  # taken from page 6 of Hibbard et al. 2023 Apj. Arbitrarily chose 25 as my v0
+
+# This identifies the pixels of the absorption region
+vec = hp.ang2vec(np.pi/2, 0)
+indices=hp.query_disc(nside=NSIDE,vec=vec,radius=0.85)
+absorp_map = copy.deepcopy(ULSA_direction[7])
+# absorp_map[indices] = 10000000
+absorp_indices = indices[np.where(absorp_map[indices] < 1450000)][750:906]
+absorp_map[absorp_indices] = 10000000
+
+manager = enlighten.get_manager()
+pbar = manager.counter(total=100, desc='Progress')
+
+n_regions = 5
+reference_frequency = 25
+
 
 # Kinetic gas temperature with a  Runge-Kutta method of order 5(4)
 
@@ -778,3 +918,231 @@ def ERB_training_set(frequency_array,parameters,N,T_k=My_Tk[1],x_e=camb_xe_inter
         training_set[n] = interpolator(redshift_array_mod)
     
     return training_set, training_set_params, training_set_rs
+
+
+#####################################################################################################################################################################
+# Foreground and Beam Stuff #
+
+def signal_training_set(path,foreground_array,times,frequency_bins,number_of_parameters,mask_negatives=True):
+    """ Creates an array that includes the beam-weighted foreground arrays with respective times of all the listed files. NOTE: Is not general and only applies to Fatima's beams. Need to change this at some point.
+    Parameters
+    ========================================================================================================
+    path: the path that contains all of the files you wish to compute the signal for. Must be a string. Right now I've only designed the function to read an entire folder.
+    foreground_array: Array of the rotated galaxy foreground. You can create this by inputting your desired galaxy map and times into the LOCHNESS function
+                     Example: foreground_array = LOCHNESS(spice_kernels,time_array,location,galaxy_map = my_galaxy_map).lunar_frame_galaxy_maps
+    times: the array of times that you used for your 
+     function. Format is [[year,month,day,hour,minute,second],[year,month,day,hour,minute,second],...]
+    frequency_bins: the number of frequency bins. Should be an interger.
+    number_of_parameters: The number of parameters in your model.
+    mask_negative":  Whether or not to mask the negative values. Should be true for galaxy maps and false for cosmological signals (since they are delta TCMB, which can be negative and often is)
+    
+    Returns
+    ========================================================================================================
+    signal_master_array: An array of all the signals for each file 
+    sma_minCMB:  Same as signal_master_array, but with the CMB subtracted off"""
+
+    files = []
+    
+    for file in os.listdir(path):
+        files.append(path+"/"+file)
+
+    parameter_set = np.ones((len(files),number_of_parameters))  # NOTE: the 3 corresponds to the 3 parameters in Fatima's beams, so not general to any beam.
+    signal_master_array = np.zeros((len(files),len(times),frequency_bins))  # place holder for now
+    for i,f in tqdm(enumerate(files)):
+        array_element=signal_from_beams(fits_beam_master_array(f),foreground_array,times,frequency_bins,mask_negatives)
+        signal_master_array[i] = array_element
+        parameters = np.array(fits_beam_master_array(f)[2])
+        parameter_set[i] = parameters
+
+    return signal_master_array, parameter_set
+
+def signal_from_beams(beam_array,foreground_array,time_array,desired_frequency_bins,mask_negatives=True,normalize_beam=True):
+    """Converts a weighted beam array into a monopole signal of frequency vs temperature
+    
+    Parameters
+    =================================================================
+    beam_array: An array of healpy maps for each frequency. The input should be from fits_beam_master_array. That function's output will match the required format of this input.
+    foreground_array: Array of the rotated galaxy foreground. You can create this by inputting your desired galaxy map and times into the LOCHNESS function
+                     Example: foreground_array = LOCHNESS(spice_kernels,time_array,location,galaxy_map = my_galaxy_map).lunar_frame_galaxy_maps
+    time_array: Array of times you wish to evaluate this at. Format is [[year,month,day,hour,minute,second],[year,month,day,hour,minute,second],...]
+    desired_frequency_bins: The number of frequency bins you desire.
+    normalize_beam = Boolean as to wheter or not you would like to normalize the beam so that all weights add to 1. Sometimes beams are packaged in a way that actually
+                     includes both the beam and the response function (how the antenna responds at each frequency), but technically the beam should not include this.
+                     Normalization is set to True as default to remove the response function from beams. If it's already removed, it won't change anything anyways.
+    
+    Returns
+    =================================================================
+    signal: An array for the signal (frequency vs brightness temperature)"""
+
+#### NOTE: we need to mask the beam to make the negative numbers equal to 0. There is a glitch with that blank spot in the ULSA map where it wants to massively inflate the negative value
+
+# now let's apply the ULSA map and weight it using the beam and collect all the frequencies into a single array:
+    frequency_bins = beam_array[1].shape[0]  # picks out the number of frequency bins in Fatima's beams. Won't work if she changes their format
+    times = time_array
+    signal = np.ones((len(times),frequency_bins,NPIX))
+    for f in range(frequency_bins):
+        signal_element = time_evolution(beam_array[1][f],foreground_array,"N/A",f,"N/A",times,animation=False,normalize_beam=normalize_beam)
+        signal[:,f] = copy.deepcopy(signal_element)
+    if mask_negatives:
+        signal[np.where(signal<0.0)] = 0  # Makes all negatives 0's as they should be. Negative temperature makes no sense in this case, though negative signal does since its delta Tb
+    # now let's add up all the pixels and bin them per frequency to get our monopole signa
+    signal_sum = np.ones((len(times),frequency_bins))
+    for t in range(len(times)):
+        for f in range(frequency_bins):
+            if normalize_beam:
+                signal_sum[t][f] = np.sum(signal[t][f])
+            else:
+                signal_sum[t][f] = np.sum(signal[t][f])/(NPIX/2) # this creates our array of summed up signals, NPIX/2 is so that we don't add all the 0's that aren't in the beam NOTE: different if you add horizon
+    
+    new_signal_sum = np.ones((len(signal_sum),desired_frequency_bins))  # creates a dummy array for later
+    for t in range(len(signal_sum)):  #picks out the time array length
+        SS_element_interpolator = scipy.interpolate.CubicSpline(range(1,len(signal_sum[0])+1),signal_sum[t]) # assumes we start at 1 MHz, creates the interpolation function
+        SS_element = SS_element_interpolator(np.arange(1,51,(50/desired_frequency_bins)))    # creates the element that will replace the index of the dummy array. Assumes a start and end frequency of 1 and 50 MHz
+        new_signal_sum[t] = SS_element 
+    
+    return new_signal_sum
+
+def fits_beam_master_array (file_path):
+    """Converts Fatima's beam files into a larger 3-D array of beams.
+    Parameters
+    ==============================================================================
+    file_path: the path of the fits file of the beam. Must be a string.
+
+    Returns
+    ==============================================================================
+    healpy_array = A healpy array that combines all the desired values
+    beam_functions = an array of interpolations per frequency"""
+    
+    file = fits.open(file_path)   # opens the fit file to be used in our function
+    data = file[8].data/(4*np.pi)  # normalizes the data. Note that the [8] is the gain part of this particular fits file convention (Fatima decided this convention)
+    beam_functions = []
+    ### This portion of the code makes the interpolation objects that will be combined together and converted to healpy arrays later.
+
+    ## This mess creates our y array. Its takes very little time just way more lines of code than I think I actually need most likely
+    array1 = np.zeros(361)
+    for i in range(len(data[0])+90):  # we have to add the 90 here to get the values below the horizon. Fatima doesn't include below horizon, have to add it in ourselves.
+        if i != 0:
+            array_element=np.ones(361)*i
+            array1=np.append(array1,array_element)
+
+    array2 = np.arange(0,361)
+    for j in range(len(data[0])+90):
+        if j != 0:
+            array_element = np.arange(0,361)
+            array2 = np.append(array2,array_element) 
+    ## ## ##
+
+    y = np.array((array2,array1)).transpose()
+    
+    zeros = np.zeros(32490)
+    for j in range(len(data)):
+        d = data[j].flatten()  # creates our data array for plugging into the interpolator
+        d= np.append(d,zeros)
+        beam_function = scipy.interpolate.RBFInterpolator(y,d,neighbors=10)  # creates a function for the beams using an interpolator.
+                                                                        # requires a 2-D array: np.array([phi,theta]) as an input.
+        beam_functions.append(beam_function)
+
+    healpy_array = np.array([ang2pix_interpolator(beam_functions[0])])
+    for i in range(len(data)):
+        if i == 0:
+            None
+        else:
+            healpy_array=np.concatenate((healpy_array,np.array([ang2pix_interpolator(beam_functions[i])])),axis=0)
+    parameter_array = []
+    parameter_array.append((file[0].header["L"],file[0].header["TOP"],file[0].header["BOTTOM"])) 
+    return beam_functions, healpy_array, parameter_array
+
+def time_evolution (beam,foreground_array,save_location,frequency,label,time_array,location = location,norm=None,max=None,animation=True,normalize_beam=True):
+    """Creates the  for a specific master beam
+    
+    Parameters
+    =============================================================================
+    beam: the healpy array that is to be mapped onto the sky. Should be (NPIX) shape. Just the one healpy array. Assumes zenith is at the top 
+          edge of the mollview (function will rotate it to the center).
+    foreground_array: the healpy array that is the galactic foreground, but already rotated. Should be (time steps,freqeuncy bins,NPIX) shape.
+                      NOTE: This could be calculated within this function, but it saves time to do it outside if your calculating 
+                            multiple beams at the same timestep, then you can apply this to each of them instead of calculating each time.
+    save_location: location you whish to save these plots (string)
+    frequency: The frequency to evaluate at. Interger
+    label: legend label of each plot (first part at least)
+    time_array: The list of times that you wish to evaluate at.
+    location: The lat lon of the LuSEE-Night lander. Default is the latest value I've seen from the mission details.
+    max: The max value displayed on the mollview map.
+    animation = Boolean as to whether or not you would like an animation of the beams to be made, cycling through frequency
+    normalize_beam = Boolean as to wheter or not you would like to normalize the beam so that all weights add to 1. Sometimes beams are packaged in a way that actually
+                     includes both the beam and the response function (how the antenna responds at each frequency), but technically the beam should not include this.
+                     Normalization is set to True as default to remove the response function from beams. If it's already removed, it won't change anything anyways.
+    Return
+    =============================================================================
+    saves the plots to the designated folder and also creates an animation in the same folder"""
+
+    # Let's do some plotting
+    foreground_array_mod = copy.deepcopy(foreground_array[:,frequency])  # this assumes that each index number associates the the same frequency number
+                                                                        # NOTE: The deepcopy makes sure changes to foreground_array_mod don't change the original foreground_array
+    beam_euler_angle = [0,90,90] # this rotates only the beam, not the galaxy, in order to match the convention of zenith being the center of the map
+    rotated_beam = hp.Rotator(rot=beam_euler_angle).rotate_map_pixel(beam)
+    if animation:
+        for i,j in  enumerate(foreground_array_mod):
+            if normalize_beam:
+                foreground_array_mod[i] = j*rotated_beam/np.sum(rotated_beam) 
+            else:
+                foreground_array_mod[i] = j*rotated_beam
+            hp.mollview(foreground_array_mod[i],title=label+ f" at {frequency}" + f" time step {i}",unit=r"$T_b$",min=0,norm=norm,max=max)
+            plt.savefig(save_location+f"/{frequency}+MHz"+f"_time_step_{i}.png")
+            plt.close()
+
+        animate_images_time(save_location,save_location+"Animation.gif",time_array, frequency)
+    else:
+        for i,j in  enumerate(foreground_array_mod):
+            if normalize_beam:
+                foreground_array_mod[i] = j*rotated_beam/(np.sum(rotated_beam))
+            else:
+                foreground_array_mod[i] = j*rotated_beam       
+    return foreground_array_mod
+
+def ang2pix_interpolator (data,coordinates=coordinate_array,normalization = 1):
+    """Converts a 3-D beam map into a healpy format (1-D array per frequency, so technically 3-D to 2-D)
+    
+    Parameters
+    =============================================================================================
+    data: an interpolation function that takes a 2D array as its argument such as np.array([altitude, azimuth])
+    normalization: The number to divide by to normalize the data. Default = 1 (assumes a normalized gain array)
+    =============================================================================================
+    Returns
+    =============================================================================================
+    data_healpy_map:  a 2-D array in the shape (frequency, 1-D healpy_map)"""
+
+    # the point is to be able to input any size of beam array and not have to worry about empty spaces due to pixels not being filled it
+    # this means we need to fill in the data if it hasn't been provided, which is very easy with an interpolation
+    ### Interpolation
+    data_healpy_map = data(coordinates)/normalization
+
+    return data_healpy_map
+
+def animate_images_time(image_folder, output_path, time_array,frequency, frame_duration=200):
+    """
+    Animates images in a folder and saves the animation as a GIF.
+
+    Args:
+        image_folder (str): Path to the folder containing the images.
+        output_path (str): Path to save the output GIF file.
+        time_array: The array of the times at which to evaluate.
+        frequency: The frequency at which to evaluate.
+        frame_duration (int, optional): Duration of each frame in milliseconds. Defaults to 200.
+    """
+    # image_files = sorted([os.path.join(image_folder, f) for f in os.listdir(image_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp'))],key=int)
+    image_files = []
+    for i in range(len(time_array)):
+        image_files.append(image_folder+f"{frequency}"+f"_time_step_{i}.png")
+
+    fig, ax = plt.subplots()
+    ims = []
+    for image_file in image_files:
+        img = Image.open(image_file)
+        im = ax.imshow(img, animated=True)
+        ims.append([im])
+
+    ani = animation.ArtistAnimation(fig, ims, interval=frame_duration, blit=True, repeat_delay=1000)
+    ani.save(output_path, writer='pillow')
+    plt.close(fig)
+
