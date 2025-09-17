@@ -1146,3 +1146,483 @@ def animate_images_time(image_folder, output_path, time_array,frequency, frame_d
     ani.save(output_path, writer='pillow')
     plt.close(fig)
 
+def simulation_run_raw (frequencies,beam_file,foreground_array,time_array,dnu,dt,omR0,omM0,omK0,omL0,omB0):
+    """Creates a simulated data curve.
+    
+    NOTE: Not general right now. Only works in the range of 1-50 MHz. Easy fix, but don't want to do that right now, since it's not needed.
+    NOTE: Also not general because the radiometer noise is built into the function (which is fine for anything I'll be doing). 
+
+    Parameters:
+    ====================================================================
+    training_set_curves: The full list of curves that Pylinex used to fit its model.  Shape (number of curves, time stamps, frequency bins)
+    training_set_parameters: The associated parameters with the training set curves. Shape (number of curves, number of parameters)
+    beam_file = The file that contains the beam_arrays
+    foreground_array: the healpy array that is the galactic foreground, but already rotated. Should be (time steps,NPIX) shape.
+                      NOTE: This could be calculated within this function, but it saves time to do it outside if your calculating 
+                            multiple beams at the same timestep, then you can apply this to each of them instead of calculating each time.
+    time_array: Array of times you wish to evaluate this at. Format is [[year,month,day,hour,minute,second],[year,month,day,hour,minute,second],...]
+    dnu: The bin size of the frequency bins. For the noise function.
+    dt: Integration time. For the noise function.
+   
+    
+    Returns
+    ====================================================================
+    simulated_data = An array of the simulated data as Temperature vs Frequency"""
+
+    # Noise function
+    sigT = lambda T_b, dnu, dt: T_b/(np.sqrt(dnu*dt))
+
+    # Loads in a beam and a signal
+    beam=fits_beam_master_array(beam_file)  # loads in a test beam
+    redshift_array = 1420.4/np.arange(1,51)
+    redshift_array = redshift_array[::-1]      # need to convert to redshift since all of our functions are in redshift
+    dTb=py21cmsig.dTb(redshift_array,py21cmsig.camb_xe_interp,py21cmsig.Tk(redshift_array,omR0,omM0,omK0,omL0)[1],omB0,omM0)*10**(-3)   # Need to convert back to Kelvin
+    dTb=dTb[::-1]   # You have to flip it again because of the way dTb calculates based on redshift (needs previous higher redshift to calculate next redshift)
+    redshift_array_expanded = 1420.4/frequencies
+    redshift_array_expanded = redshift_array_expanded[::-1]      # need to convert to redshift since all of our functions are in redshift
+    dTb_expanded=py21cmsig.dTb(redshift_array_expanded,py21cmsig.camb_xe_interp,py21cmsig.Tk(redshift_array_expanded,omR0,omM0,omK0,omL0)[1],omB0,omM0)*10**(-3)   # Need to convert back to Kelvin
+    dTb_expanded=dTb_expanded[::-1]   # You have to flip it again because of the way dTb calculates based on redshift (needs previous higher redshift to calculate next redshift)
+
+    # Let's now add this to our galaxy map
+    signal_foreground_array = np.zeros_like(foreground_array)
+    for t in range(len(foreground_array)):
+        for i,j in enumerate(dTb):
+            signal_foreground_array[t][i] = foreground_array[t][i]+j   # adds the signal to each frequency
+
+    # Now let's weight this using a beam and LOCHNESS to rotate it
+    simulation_test_raw = signal_from_beams(beam,signal_foreground_array,time_array,50) #the non-interpolated version with only 50 frequency bins
+    simulation_test_interp = scipy.interpolate.CubicSpline(range(1,51),simulation_test_raw[0])
+    simulation_test = simulation_test_interp(frequencies)
+    simulation_test_no_noise = copy.deepcopy(simulation_test)
+    # Now we add radiometer noise
+
+    for i in range(len(frequencies)):
+        simulation_test[i] = np.random.normal(simulation_test[i],sigT(simulation_test[i],dnu,dt))
+
+    signal_only = dTb_expanded   # the non-interpolated version with only 50 frequency bins
+    foreground_only_raw = signal_from_beams(beam,foreground_array,time_array,50)
+    foreground_interp = scipy.interpolate.CubicSpline(range(1,51),foreground_only_raw[0])
+    foreground_only = foreground_interp(frequencies)
+    noise_only = simulation_test - signal_only - foreground_only
+
+    return simulation_test, signal_only, foreground_only, noise_only, simulation_test_no_noise, simulation_test_raw
+
+def make_foreground_model(frequencies,n_regions,sky_map,reference_frequency,rms_mean,rms_std,absorption_region = True,\
+                           absorp_indices = None,plot_regions=True,scale=0.1,ev_num=1e6,show_region_map=True):
+    """Make a foreground model from a number of regions (add an absorption region if you'd like). Also can define a reference frequency.
+    This function's primary purpose is to return a Bayesian evidence value that can be used to compare different foreground models.
+    
+    Parameters
+    =============================================
+    frequencies: Frequencies you're evaluating at. Array
+    n_regions: The number of regions you want in your foreground model
+    sky_map: Your reference model for your regions. Examples include Haslam, Guzman, GMS, ULSA, etc. Already rotated into the correct time.
+    reference_frequency: The frequency of the sky map that you are using to create your regions.
+    rms_mean: The mean of the rms. See one_sigma_rms for a better understanding of how to get this if you're unsure.
+    rms_std: This is the rms value that defines a one sigma deviation from the "correct" answer. The best way to calculate this in my opinion
+                    is to use a bootstrapping method with your noise. This means just run several thousand iterations of random noise, determining
+                    the rms for each run. Then use the standard deviation of those many runs as your one_sigma_rms. 
+    synchrotron_parameters: The parameters for the synchrotron equation. Need to be an array of the shape (3,)
+                            Parameters are (amplitude,spectral index,spectral curvature)
+    absorption_region: Boolean of whether you want an additional region for the absoprtion zone at the center of the galaxy
+                       NOTE: This isn't general right now, and only works if your resolution is 32
+    absorpt_indices: The indices of the 32 bit map that include the absorption region
+    plot_regions: Whether or not you'd like a plot of the regions on the sky.
+    scale: The variation from the best fit of the best fit paramters when making new curves for the evidence.
+    ev_num: Number of curves to make for the evidence set.
+    show_region_map: Whether or not to show the sky view of the regions.
+    
+
+    Returns
+    =============================================
+    """
+
+    # Synchrotron Equation:
+    temps = np.sum(sky_map[frequencies[0]-1:frequencies[-1]+1],axis=1)/NPIX # temps from sky map
+    noise = sigT(temps,dnu,dt)  # usually globally defined
+    synchrotron = synch  # globally defines variable
+
+    patch=perses.models.PatchyForegroundModel(frequencies,sky_map[reference_frequency],n_regions)
+    indices = patch.foreground_pixel_indices_by_region_dictionary # gives the indices of each region
+
+    # creates an absorption region at the center of the plane of the milky way (where the synchrotron radiation is heavily absorbed)
+    if absorption_region:
+        for r in range(len(indices)):
+            for v in absorp_indices: # removes the absorption region from the low number region
+                if v in indices[r]: 
+                    indices[r].remove(v)
+        indices["a"] = absorp_indices
+    
+    # plots the regions on the sky map
+    if plot_regions:
+        region_map=np.zeros_like(sky_map[reference_frequency])
+        for r,v in zip(indices,range(len(indices))):
+            region_map[indices[r]] = v
+        if show_region_map:
+            hp.mollview(region_map)
+
+    # creates a curve of the sky map, per region, which will be the data we want to fit against
+    total_signal = np.zeros((len(indices),len(frequencies)))
+    for i,r in enumerate(indices):
+        signal_sum = np.array([])
+        for f in frequencies-1:
+            signal_sum_element = np.sum(sky_map[f][indices[r]]/len(indices[r]))
+            signal_sum = np.append(signal_sum,signal_sum_element)
+        total_signal[i] = signal_sum
+    # Identifies the best fit using a least squares for the synchrotron parameters 
+
+    best_fit_params = np.zeros((len(indices),3)) # 3 parameters in the synchrotron equation
+    best_fit_params_error = np.zeros((len(indices),3,3))
+    best_fit_curves = np.zeros((len(indices),len(frequencies)))
+    for p in range(len(indices)):
+        best_fit_params[p]=scipy.optimize.curve_fit(synchrotron,frequencies,total_signal[p],sigma=noise)[0]
+        best_fit_params_error[p] = scipy.optimize.curve_fit(synchrotron,frequencies,total_signal[p],sigma=noise)[1]
+        best_fit_curves[p] = synchrotron(frequencies,best_fit_params[p][0],best_fit_params[p][1],best_fit_params[p][2])
+
+    # root mean square of each regions best fit curve
+    region_rms = np.array([])
+    for j in range(len(indices)):
+        rms = np.sqrt(np.mean((best_fit_curves[j]-total_signal[j])**2))
+        region_rms = np.append(region_rms,rms)
+
+    # evidence of this model
+    model_priors = 1/ev_num
+    model_likelihood = 0
+    curves = np.zeros((ev_num,len(frequencies)))
+    for n in tqdm(range(int(ev_num))):
+        region_element = np.zeros(len(frequencies))
+        for i,c in enumerate(indices): # creates the temperature vs frequency curves for new, varied parameters
+            region_element += synchrotron(frequencies,best_fit_params[i][0]+best_fit_params[i][0]*(2*scale*np.random.random()-scale),best_fit_params[i][1]+best_fit_params[i][1]*(2*scale*np.random.random()-scale),\
+                                          best_fit_params[i][2]+best_fit_params[i][2]*(2*scale*np.random.random()-scale))*len(indices[c])/NPIX
+        curves[n] = region_element
+    stats = calculate_rms(curves,temps,rms_mean,rms_std) # calculates p-values
+    model_likelihood = np.sum(stats[2])
+    evidence = model_likelihood*model_priors  # NOTE: only works because all parameters have the same probability
+
+    return best_fit_params, best_fit_curves, region_rms, total_signal, region_element, best_fit_params_error, temps, curves, \
+        stats, evidence, indices
+
+def B_value_interp(beam_sky_training_set,beam_sky_training_set_params,\
+                         frequencies,sky_map,reference_frequency,n_regions):
+    """Interpolates the beam weighting per region for the synchrotron_foreground
+    
+    Parameters
+    ============================================
+    frequencies: The array of frequencies you wish to evaluate at.
+    n_regions: The number of regions you want in your foreground model
+    sky_map: Your reference model for your regions. Examples include Haslam, Guzman, GMS, ULSA, etc. Already rotated into the correct time.
+    reference_frequency: The frequency of the sky map that you are using to create your regions.
+    beam_sky_training_set: The set of beams in your training set (in full sky map form). This can be from the raw training set, so you don't
+                            have to create interpolated beam sky maps. This function will interpolate from this the values you need.
+                            Should be shape (n curves, frequency bins, NPIX)
+    beam_sky_training_set_params: The parameters associated with the beam_sky_training_set. Should be shape (n curves,n parameters per curve)
+    beam_curve_training_set: This is the training set that is temperature vs frequency. You'll need this one as well. This one need not
+                            be the raw training set. Should be shape (n curves, frequency bins)
+
+    Returns
+    ============================================"""
+
+    patch=perses.models.PatchyForegroundModel(frequencies,sky_map[reference_frequency],n_regions)
+    new_region_indices = patch.foreground_pixel_indices_by_region_dictionary # gives the indices of each region
+    t = 0
+    B_values_raw = np.zeros((len(beam_sky_training_set),len(beam_sky_training_set[0]),len(new_region_indices)))
+    B_values = np.zeros((len(beam_sky_training_set),len(frequencies),len(new_region_indices)))
+    for n in tqdm(range(len(beam_sky_training_set))):
+        for f in range(len(beam_sky_training_set[0])):
+            for i,r in enumerate(new_region_indices):
+                B_values_raw[n][f][i]=np.sum(beam_sky_training_set[n][f][new_region_indices[r]])
+        B_values_interp = scipy.interpolate.CubicSpline(np.arange(1,len(beam_sky_training_set[0])+1),B_values_raw[n])
+        B_values[n] = B_values_interp(frequencies)
+    expanded_B_values_interpolator = {}
+    for f in range(len(frequencies)):
+        values = B_values[:,f]
+        params = beam_sky_training_set_params
+        expanded_B_values_interp=scipy.interpolate.NearestNDInterpolator(params,values)
+        expanded_B_values_interpolator[f]=expanded_B_values_interp
+
+    return expanded_B_values_interpolator
+
+def synchrotron_foreground_forsigex(n_regions,frequencies,reference_frequency,sky_map, BTS_curves, BTS_params,\
+                           beam_sky_training_set,beam_sky_training_set_params,N,parameter_variation,B_value_functions\
+                            ,define_parameter_mean = False,parameter_mean = 0, print_parameter_variation = True):
+    """Creates a training set for the five region model
+    
+    Parameters
+    =======================================================
+    n_regions: Number of regions in your patchy sky model
+    data: The actual data you are fitting to. Should be shape (frequency bins)
+    noise: The noise corresponding to each frequency bin. Should be shape (frequency bins)
+    frequencies: The frequency range you wish to evaluate at. Defines your frequency bins.
+    reference_frequency: The frequency you used to create your patchy regions
+    sky_map: The galaxy map, rotated into your LST, that is being used for the simulated data. Shape(frequency bins, NPIX)
+    BTS_curves: The beam training set curves. This should already include the beams weighting the base foreground model.
+                I could make this function do that, but it often takes some time, so I think it's better to do that externally
+                in case you wanted to save it and  Should be shape (n curves,frequency bins)
+    BTS_params: The corresponding parameters for the beam curves. Should be shape (n curves, n parameters per beam)
+    beam_sky_training_set: The set of beams in your training set (in full sky map form). This can be from the raw training set, so you don't
+                            have to create interpolated beam sky maps. This function will interpolate from this the values you need.
+                            Should be shape (n curves, frequency bins, NPIX)
+    beam_sky_training_set_params: The parameters associated with the beam_sky_training_set. Should be shape (n curves,n parameters per curve)
+    N: Number of varied foregrounds you wish to have in the training set.
+    parameter_variation:  The variation in the parameters. This will be a multiplicative factor. Shoud be shape (3)
+    B_value_functions: Defines the set of B_value interpolators that are used to determine the B_values.
+    sky_map_training_set:  Whether or not you want sky maps for each of the varied foregrounds. Take a lot of time and data
+                           to build that many sky maps, so be wary.
+    determine_parameter_range: Whether or not to determine the parameter range based on the training set of everything except
+                               the foreground
+    define_parameter_mean: Whether or not to define a new parameter mean. See parameter_mean below for more details.
+    parameter_mean: The mean value that the parameter_viariation values will center around. By default it is the best fit parameters.
+    Returns
+    ======================================================="""
+    t=0
+    synchrotron = synch
+    optimized_parameters = np.zeros((n_regions,3)) # three parameters in the synchrotron model: Amplitude, spectral index, spectral cuvature
+    patch=perses.models.PatchyForegroundModel(frequencies,sky_map[reference_frequency-1],n_regions) # define the regional patches
+    B_values = np.zeros((len(BTS_curves),len(frequencies),n_regions))
+    for i,b in enumerate(BTS_params):
+        for f in range(len(frequencies)):
+            B_values[i][f] = B_value_functions[f](b)
+    region_indices = patch.foreground_pixel_indices_by_region_dictionary
+    region_data = np.zeros((n_regions,len(frequencies)))
+    optimized_parameters = np.zeros((n_regions,3)) # three parameters in the synchrotron model: Amplitude, spectral index, spectral cuvature
+    masked_indices = np.where(beam_sky_training_set[0][-1] == 0)[0]
+
+   
+    ## This loop will populate the temperatures of each region and fit a best fit to that region for synchrotron
+    for i,r in enumerate(region_indices): 
+        region_temps_raw = np.array([])
+        for f in range(len(sky_map)):
+            region_temps_element = sky_map[f][region_indices[r]].mean() # The index on the sky map is NOTE: Not general
+            region_temps_raw = np.append(region_temps_raw,region_temps_element)           # assumes a specific index convention (index = frequency - 1)        
+        region_temps_interp = scipy.interpolate.CubicSpline(range(1,len(sky_map)+1),region_temps_raw)
+        region_temps = region_temps_interp(frequencies)
+        region_data[i] = region_temps
+        params = scipy.optimize.curve_fit(synchrotron,frequencies,region_temps)[0]
+        optimized_parameters[i] = params
+
+
+
+    ## This loop creates the difference array that will be added to each foreground frequency
+    new_parameters = np.zeros((N,n_regions,3))
+    new_foreground_deltaT = np.zeros((N,n_regions,len(frequencies)))
+    if define_parameter_mean:
+        model_mean = parameter_mean
+    else:
+        model_mean = copy.deepcopy(optimized_parameters)
+
+    # This loop creates the difference in temperature from the base model based on the new parameters randomly generated
+    for n in tqdm(range(N)):
+            for r in range(n_regions):
+                new_parameter_element = np.array([model_mean[r][0]*(1+(parameter_variation[0] - 2*parameter_variation[0]*np.random.random()))\
+                                        ,model_mean[r][1]*(1+(parameter_variation[1] - 2*parameter_variation[1]*np.random.random()))\
+                                        ,model_mean[r][2]*(1+(parameter_variation[2] - 2*parameter_variation[2]*np.random.random()))])   
+                new_parameters[n][r] = new_parameter_element
+                new_temp = synch(frequencies,new_parameter_element[0],new_parameter_element[1],new_parameter_element[2])
+                delta_temp = new_temp - synch(frequencies,optimized_parameters[r][0],optimized_parameters[r][1],optimized_parameters[r][2])
+                new_foreground_deltaT[n][r] = delta_temp
+    
+
+
+    # This loop weights the new change in mean temperature per region with the beam value associated
+
+    new_curves = np.zeros((len(B_values),N,len(frequencies)))
+    for b in tqdm(range(len(BTS_curves))):
+        weighted_deltaT = np.zeros((N,len(frequencies)))
+        for n in range(N):
+            for r in range(n_regions):
+                weighted_deltaT[n] += new_foreground_deltaT[n][r]*B_values[b,:,r]
+            #     training_set_params_row = np.append(training_set_params_row,new_parameters[n][r]) 
+            # training_set_params_row = np.append(training_set_params_row,BTS_params[b])
+            # training_set_params = np.concatenate((training_set_params,[training_set_params_row]),axis=0)
+            new_curves[b][n] = BTS_curves[b]+weighted_deltaT[n]
+            # training_set = np.concatenate((training_set,[new_curves[b][n]]),axis=0)
+
+
+
+    # This loop takes a wierdly long amount of time to run and just massages the arrays into the proper format for PYLINEX
+
+    training_set_size = len(BTS_curves)*N
+    parameter_length = len(new_parameters[0][0])*n_regions+len(BTS_params[0])
+    training_set = np.zeros((training_set_size,len(frequencies)))
+    training_set_params = np.zeros((training_set_size,parameter_length))
+    x = -1
+    for b in tqdm(range(len(BTS_curves))):
+        for n in range(N):
+            training_set_params_row = np.array([])
+            x += 1
+            for r in range(n_regions):
+                training_set_params_row = np.append(training_set_params_row,new_parameters[n][r]) 
+            training_set[x] = new_curves[b][n]
+            training_set_params_row = np.append(training_set_params_row,BTS_params[b])
+            training_set_params[x] = training_set_params_row
+    if print_parameter_variation:
+        print(parameter_variation)
+
+    
+
+    return optimized_parameters,new_curves,masked_indices, training_set, training_set_params
+
+## NOTE: This doesn't include multiple time stamps. Do we need to even bother? Something to think about.
+def expanded_training_set_no_t(STS_data,STS_params,N,custom_parameter_range=np.array([0]),show_parameter_ranges=False):
+    """Convert a signal_training_set output into a much larger training set by interpolating over the parameters per frequency
+    This is basically a 1 dimensional MEDEA.
+    
+    Parameters
+    ====================================================
+    STS_data: An output of the signal_training_set function. As of writing this it is the first output, so variable[0]
+                              would be the correct call if that variable was set to the output of that function. 
+    STS_params: An output of the signal_training_set function. As of writing this it is the second output, so variable[1]
+    N:  The number of curves you wish to have in this new training set
+    custom_parameter_range: This will replace the automatically generator parameter range. Make sure it will still be within
+                            the parameter range of the training set and is of the correct shape. Default to False since it's 
+                            a bit more advanced of a parameter. Shape is (n parameters, 2(min and max))
+
+    Returns
+    ====================================================
+    expanded_training_set: A new training set interpolated from the old with N curves
+    expanded_training_set_params: The associated parameters of the new training set
+    new_data: This is an interpolator that allows you to plug in any parameter value and get the curve. Handy for some investigation work"""
+
+    param_value_ranges_array = np.ones((len(STS_params[0]),2))   # dummy arrray for parameter ranges that will be populated later
+    
+    if custom_parameter_range.any() == 0:  # checks to see if you've set a cust range of parameters for the expanded training set
+        for i in range(len(STS_params[0])):   # Here we start to populate the array of parameter ranges. I call [0] because all entries should have the same number of parameters
+            pr_element = [STS_params[:,i].min(),STS_params[:,i].max()]
+            param_value_ranges_array[i] = pr_element
+    else:
+        param_value_ranges_array=custom_parameter_range
+
+    expanded_training_set = np.ones((N,len(STS_data[0])))    # dummy array for the expanded training set
+    expanded_training_set_params = np.ones((N,len(STS_params[0])))   # dummy array for the parameters of this expanded set
+
+    for n in range(N):   # this will create our list of new parameters that will be randomly chosen from within the original training set's parameter space.
+        new_params = np.array([])
+        for k in range(len(STS_params[0])):  # this will create a new set of random parameters for each instance
+            p = param_value_ranges_array[k]
+            new_params = np.append(new_params,np.random.random()*(p[1]-p[0])+p[0])
+        expanded_training_set_params[n] = new_params  
+    for f in tqdm(range(len(STS_data[0]))):    # loops through all frequencies
+        values = STS_data[:,f]
+        new_data=scipy.interpolate.griddata(STS_params,values,expanded_training_set_params)
+        expanded_training_set[:,f] = new_data 
+    if show_parameter_ranges:
+        print(param_value_ranges_array)
+
+    return expanded_training_set, expanded_training_set_params
+
+def simulation_run (weighted_foreground,signal_model,dnu,dt):
+    """Creates a simulated data curve.
+    
+    NOTE: Not general right now. Only works in the range of 1-50 MHz. Easy fix, but don't want to do that right now, since it's not needed.
+    NOTE: Also not general because the radiometer noise is built into the function (which is fine for anything I'll be doing). 
+
+    Parameters:
+    ====================================================================
+    training_set_curves: The full list of curves that Pylinex used to fit its model.  Shape (number of curves, time stamps, frequency bins)
+    training_set_parameters: The associated parameters with the training set curves. Shape (number of curves, number of parameters)
+    beam_file = The file that contains the beam_arrays
+    foreground_array: the healpy array that is the galactic foreground, but already rotated. Should be (time steps,NPIX) shape.
+                      NOTE: This could be calculated within this function, but it saves time to do it outside if your calculating 
+                            multiple beams at the same timestep, then you can apply this to each of them instead of calculating each time.
+    signal_model: The signal model to use to add the signal into the simulation. Will be a curve of shape (frequencies).
+    time_array: Array of times you wish to evaluate this at. Format is [[year,month,day,hour,minute,second],[year,month,day,hour,minute,second],...]
+    dnu: The bin size of the frequency bins. For the noise function.
+    dt: Integration time. For the noise function.
+   
+    
+    Returns
+    ====================================================================
+    simulated_data = An array of the simulated data as Temperature vs Frequency"""
+
+    # Noise function
+    sigT = lambda T_b, dnu, dt: T_b/(np.sqrt(dnu*dt))
+
+    simulation_no_noise = weighted_foreground + signal_model
+    simulation = np.zeros_like(simulation_no_noise)
+    # Now we add radiometer noise
+
+    for i in range(len(weighted_foreground)):
+        simulation[i] = np.random.normal(simulation_no_noise[i],sigT(simulation_no_noise[i],dnu,dt))
+
+    signal_only = signal_model
+    foreground_only = weighted_foreground
+    noise_only = simulation - signal_only - foreground_only
+
+    return simulation, signal_only, foreground_only, noise_only, simulation_no_noise
+
+def calculate_rms(curves,reference_curve,rms_mean,rms_std,curve_parameters=None):
+    """Calculates the rms, z_score, and p_value for a specific curves vs a reference curve
+    
+    Parameters
+    =============================================
+    curves: An array of shape (number of curves, curve_array)
+    curve_parameters: An array of the parameters associated with each curve. Not always necessary, so I've defaulted them to None.
+    reference_curve: The curve you're comparing all the other curves to
+    rms_mean: The mean of the rms. See one_sigma_rms for a better understanding of how to get this if you're unsure.
+    rms_std: This is the rms value that defines a one sigma deviation from the "correct" answer. The best way to calculate this in my opinion
+                    is to use a bootstrapping method with your noise. This means just run several thousand iterations of random noise, determining
+                    the rms for each run. Then use the standard deviation of those many runs as your one_sigma_rms. 
+
+    Returns
+    =============================================
+    rms_array: List of rms values per curve
+    sorted_rms: List of rms values sorted from lowest to highest
+    p_value_array: List of p_values for each curve.
+    """
+    
+    rms_array = np.array([])
+    z_score_array = np.array([])
+    p_value_array = np.array([])
+    for n in tqdm(range(len(curves))):    
+        rms = np.sqrt(np.mean(curves[n]-reference_curve)**2)
+        rms_array = np.append(rms_array,rms)
+        z_score = np.abs(rms-rms_mean)/rms_std
+        z_score_array = np.append(z_score_array,z_score)
+        p_value = scipy.stats.norm.sf(z_score)
+        p_value_array = np.append(p_value_array,p_value)
+
+    return rms_array, z_score_array, p_value_array, curve_parameters
+
+def narrowed_training_set(data,rms_mean,one_sigma_rms,training_set,training_set_parameters,sigma_tolerance = 5):
+    """This uses the rms of the residuals to narrow the training set so that the included curves are only the curves within some 
+     defined sigma of the rms of the noise.  This is useful for hammering down the wildly inaccurate curves from the training set
+      so that PYLINEX doesn't lose its mind over them. PYLINEX does not do well with too large of a parameter space. Note that due
+      to some issues with arrays, this only handles one time stamp at a time. You will need to loop through this function to 
+      do all time stamps.
+       
+    Parameters
+    ============================================================
+    data: The simulated or real data that our training set will attempt to fit. Should be an array of the shape (number of time steps, frequency bins)
+    rms_mean: The mean of the rms. See one_sigma_rms for a better understanding of how to get this if you're unsure.
+    one_sigma_rms: This is the rms value that defines a one sigma deviation from the "correct" answer. The best way to calculate this in my opinion
+                    is to use a bootstrapping method with your noise. This means just run several thousand iterations of random noise, determining
+                    the rms for each run. Then use the standard deviation of those many runs as your one_sigma_rms.
+    training_set: The first return of the signal_trainin_set function or expanded_training_set. The array that contains all of the curves that
+                  your are attempting to fit the data to. Should be an array of the shape (number of curves, number of time steps, frequency bins)
+    training_set_parameters: the second return of the signal_training_set function or expanded_training_set. The array should contain all of the
+                            parameters associated with each individual training set curve. Should be size (number of curves, number of parameters)
+    sigma_tolerance: The number of sigma from the data fit residual that you would like to include in the new, narrowed training set. 
+                     Interger or float.
+                  
+    Returns
+    =============================================================
+    narrowed_set: A new, narrowed training set that contains the curves within the sigma_tolerance range.
+    narrowed_parameters: The collection of parameters that correspond to the narrowed training set curves
+    rms_array: An array of all the rms values of each curve. Important for some other functions.
+    training_set: Just returns the same input parameter above. Important for some other functions.
+    training_set_parameters: Just returns the same input parameter above. Important for some other functions."""
+
+    # First step is to create the bootstrapped sigma from the data_fit_residual.
+    # In more plain words: We take the signal we should get if the data was a perfect fit and calculate the rms. Then do this many times.
+    
+    rms_array= np.zeros((len(training_set)))  # creates dummy array for our rms values for each curve
+    sigma_array = np.zeros_like(rms_array)    # create a dummy array for the distance in sigma that each curve is from the noise
+    for i in tqdm(range(len(training_set))):      # loops through all the curves, subtracts the data from them, and then calculates the rms for each.
+        differencing_element = data - training_set[i]
+        rms_element = np.sqrt(np.mean(differencing_element**2))
+        rms_array[i] = rms_element    # creates an array of the rms values for each training set curve
+        sigma_array[i] = np.abs(rms_element-rms_mean)/one_sigma_rms   # creates an array of the distance from the noise is sigma of each training set curve.
+    narrowed_set=training_set[np.where(sigma_array<sigma_tolerance)]
+    narrowed_set_parameters=training_set_parameters[np.where(sigma_array<sigma_tolerance)]
+
+    return narrowed_set, narrowed_set_parameters, rms_array, training_set, training_set_parameters
