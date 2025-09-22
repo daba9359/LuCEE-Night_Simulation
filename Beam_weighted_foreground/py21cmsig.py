@@ -135,7 +135,7 @@ dTb = lambda z,x_e,T_k,omB0,omM0: 27*(1-x_e(z))*((h**2*omB0)/(0.023))*(((0.15)/(
 
 ########### Foreground and Beam Related Constants ###################
 
-NSIDE = 32 # resolution of the map
+NSIDE = 64 # resolution of the map
 NPIX = hp.nside2npix(NSIDE)
 NPIX   # total number of pixels (size of the array being used)
 location = (-23.815,182.25)  # The lat lon location of the moon landing site
@@ -165,7 +165,8 @@ gal = perses.foregrounds.HaslamGalaxy()
 haslam_data=gal.get_map(39.93) # gets the actual array of the data for that haslam map
 
 # ULSA map
-ULSA_direction_raw = fits.open("/home/dbarker7752/21_cm_group/ULSA Maps/000.fits")
+# ULSA_direction_raw = fits.open("/home/dbarker7752/21_cm_group/ULSA Maps/000.fits") # 32 bit version
+ULSA_direction_raw = fits.open("/home/dbarker7752/21_cm_group/ULSA Maps/100.fits") # 64 bit version
 ULSA_frequency = fits.open("/home/dbarker7752/21_cm_group/ULSA Maps/210.fits")
 ULSA_constant = fits.open("/home/dbarker7752/21_cm_group/ULSA Maps/220.fits")
 
@@ -173,7 +174,7 @@ ULSA_constant = fits.open("/home/dbarker7752/21_cm_group/ULSA Maps/220.fits")
 
 # This identifies the pixels of the dead zone
 vec = hp.ang2vec(np.pi/2*1.1, -np.pi/2*1.05)
-indices=hp.query_disc(nside=NSIDE,vec=vec,radius=0.19)
+indices=hp.query_disc(nside=NSIDE,vec=vec,radius=0.1954)
 hole_map = copy.deepcopy(ULSA_direction_raw[0].data[7])
 hole_map[indices] = 10000000
 hp.mollview(ULSA_direction_raw[0].data[7])
@@ -956,7 +957,8 @@ def signal_training_set(path,foreground_array,times,frequency_bins,number_of_par
 
     return signal_master_array, parameter_set
 
-def signal_from_beams(beam_array,foreground_array,time_array,desired_frequency_bins,mask_negatives=True,normalize_beam=True):
+## This function coverts a weighted foreground set (with all frequencies) into a signal (frequency vs temperature)
+def signal_from_beams(beam_array,foreground_array,time_array,desired_frequency_bins,mask_negatives=True,normalize_beam=True,rotate_beams=True):
     """Converts a weighted beam array into a monopole signal of frequency vs temperature
     
     Parameters
@@ -969,6 +971,7 @@ def signal_from_beams(beam_array,foreground_array,time_array,desired_frequency_b
     normalize_beam = Boolean as to wheter or not you would like to normalize the beam so that all weights add to 1. Sometimes beams are packaged in a way that actually
                      includes both the beam and the response function (how the antenna responds at each frequency), but technically the beam should not include this.
                      Normalization is set to True as default to remove the response function from beams. If it's already removed, it won't change anything anyways.
+    rotate_beams: Whether or not to rotate the beams from a top zenith to a center of mollview zenith (usually have to do this with CEM produced beams).
     
     Returns
     =================================================================
@@ -981,7 +984,7 @@ def signal_from_beams(beam_array,foreground_array,time_array,desired_frequency_b
     times = time_array
     signal = np.ones((len(times),frequency_bins,NPIX))
     for f in range(frequency_bins):
-        signal_element = time_evolution(beam_array[1][f],foreground_array,"N/A",f,"N/A",times,animation=False,normalize_beam=normalize_beam)
+        signal_element = time_evolution(beam_array[1][f],foreground_array,"N/A",f,"N/A",times,animation=False,normalize_beam=normalize_beam,rotate_beams=rotate_beams)
         signal[:,f] = copy.deepcopy(signal_element)
     if mask_negatives:
         signal[np.where(signal<0.0)] = 0  # Makes all negatives 0's as they should be. Negative temperature makes no sense in this case, though negative signal does since its delta Tb
@@ -1052,7 +1055,8 @@ def fits_beam_master_array (file_path):
     parameter_array.append((file[0].header["L"],file[0].header["TOP"],file[0].header["BOTTOM"])) 
     return beam_functions, healpy_array, parameter_array
 
-def time_evolution (beam,foreground_array,save_location,frequency,label,time_array,location = location,norm=None,max=None,animation=True,normalize_beam=True):
+# let's create an animation of the time evolution of a specific beam weighted foreground at a specific frequency
+def time_evolution (beam,foreground_array,save_location,frequency,label,time_array,location = location,norm=None,max=None,animation=True,normalize_beam=True,rotate_beams=True):
     """Creates the  for a specific master beam
     
     Parameters
@@ -1072,6 +1076,7 @@ def time_evolution (beam,foreground_array,save_location,frequency,label,time_arr
     normalize_beam = Boolean as to wheter or not you would like to normalize the beam so that all weights add to 1. Sometimes beams are packaged in a way that actually
                      includes both the beam and the response function (how the antenna responds at each frequency), but technically the beam should not include this.
                      Normalization is set to True as default to remove the response function from beams. If it's already removed, it won't change anything anyways.
+    rotate_beams: Whether or not to rotate the beams from a top zenith to a center of mollview zenith (usually have to do this with CEM produced beams).
     Return
     =============================================================================
     saves the plots to the designated folder and also creates an animation in the same folder"""
@@ -1080,7 +1085,9 @@ def time_evolution (beam,foreground_array,save_location,frequency,label,time_arr
     foreground_array_mod = copy.deepcopy(foreground_array[:,frequency])  # this assumes that each index number associates the the same frequency number
                                                                         # NOTE: The deepcopy makes sure changes to foreground_array_mod don't change the original foreground_array
     beam_euler_angle = [0,90,90] # this rotates only the beam, not the galaxy, in order to match the convention of zenith being the center of the map
-    rotated_beam = hp.Rotator(rot=beam_euler_angle).rotate_map_pixel(beam)
+    if rotate_beams:
+        rotated_beam = hp.Rotator(rot=beam_euler_angle).rotate_map_pixel(beam)
+    rotated_beam = beam
     if animation:
         for i,j in  enumerate(foreground_array_mod):
             if normalize_beam:
