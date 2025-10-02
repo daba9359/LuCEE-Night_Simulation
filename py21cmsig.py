@@ -217,10 +217,11 @@ redshift_array = 1420.4/frequency_array-1
 # foreground_array_minCMB[np.where(foreground_array_minCMB<0.0)] = 0
 
 # radiometer noise
-sigT = lambda T_b, dnu, dt: T_b/(np.sqrt(dnu*dt))
+sigT = lambda T_b, N, dnu, dt: T_b/(N*(np.sqrt(dnu*dt)))
 # Noise parameters
 dnu = 1e6
 dt = 10000*3600 # first number is the number of hours of integration time
+N_antenna = 2
 
 # Synchrotron Equation
 synch = lambda f,A,B,c : A*(f/408)**(B+c*np.log(f/408))  # taken from page 6 of Hibbard et al. 2023 Apj. Arbitrarily chose 25 as my v0
@@ -1246,7 +1247,7 @@ def make_foreground_model(frequencies,n_regions,sky_map,reference_frequency,rms_
 
     # Synchrotron Equation:
     temps = np.sum(sky_map[frequencies[0]-1:frequencies[-1]+1],axis=1)/NPIX # temps from sky map
-    noise = sigT(temps,dnu,dt)  # usually globally defined
+    noise = sigT(temps,N_antenna,dnu,dt)  # usually globally defined
     synchrotron = synch  # globally defines variable
 
     patch=perses.models.PatchyForegroundModel(frequencies,sky_map[reference_frequency],n_regions)
@@ -1517,7 +1518,7 @@ def expanded_training_set_no_t(STS_data,STS_params,N,custom_parameter_range=np.a
 
     return expanded_training_set, expanded_training_set_params
 
-def simulation_run (weighted_foreground,signal_model,dnu,dt):
+def simulation_run (weighted_foreground,signal_model,N_antenna,dnu,dt):
     """Creates a simulated data curve.
     
     NOTE: Not general right now. Only works in the range of 1-50 MHz. Easy fix, but don't want to do that right now, since it's not needed.
@@ -1533,6 +1534,7 @@ def simulation_run (weighted_foreground,signal_model,dnu,dt):
                             multiple beams at the same timestep, then you can apply this to each of them instead of calculating each time.
     signal_model: The signal model to use to add the signal into the simulation. Will be a curve of shape (frequencies).
     time_array: Array of times you wish to evaluate this at. Format is [[year,month,day,hour,minute,second],[year,month,day,hour,minute,second],...]
+    N_antenna: Number of antennas in your system.
     dnu: The bin size of the frequency bins. For the noise function.
     dt: Integration time. For the noise function.
    
@@ -1542,14 +1544,14 @@ def simulation_run (weighted_foreground,signal_model,dnu,dt):
     simulated_data = An array of the simulated data as Temperature vs Frequency"""
 
     # Noise function
-    sigT = lambda T_b, dnu, dt: T_b/(np.sqrt(dnu*dt))
+    sigT = lambda T_b, N, dnu, dt: T_b/(N*(np.sqrt(dnu*dt)))
 
     simulation_no_noise = weighted_foreground + signal_model
     simulation = np.zeros_like(simulation_no_noise)
     # Now we add radiometer noise
 
     for i in range(len(weighted_foreground)):
-        simulation[i] = np.random.normal(simulation_no_noise[i],sigT(simulation_no_noise[i],dnu,dt))
+        simulation[i] = np.random.normal(simulation_no_noise[i],sigT(simulation_no_noise[i],N_antenna,dnu,dt))
 
     signal_only = signal_model
     foreground_only = weighted_foreground
